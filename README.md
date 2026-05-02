@@ -1,89 +1,100 @@
-# 篮球投篮自动剪辑工具
+# Basketball Goal Detector
 
-自动检测篮球视频中投篮穿过篮筐的瞬间，剪辑并输出视频片段。
+自动检测篮球视频中的进球事件，输出进球前3s+后1s的完整视频片段。
 
-## 依赖
+主程序：`backboard_ball_detector.py`
 
-- Python 3.11+
-- OpenCV (`opencv-python-headless` 或 `opencv-python`)
-- NumPy
+## 检测流程
 
-```bash
-pip install opencv-python-headless numpy
+```
+Phase 1: 篮板ROI滚动差分扫描（每0.1s采样）
+    ↓ 球候选帧
+Phase 2: 聚类（gap≤2s合并为事件）
+    ↓ 事件列表
+Phase 3: 轨迹分析 + 进球判定 + 漂移修正
+    ↓ 进球事件
+输出: 完整画面视频片段（进球前3s + 后1s）
 ```
 
-## 使用方法
-
-### 基本用法
+## 快速开始
 
 ```bash
-python basketball_clipper.py input_video.mp4
+# 1. 标定ROI（交互式，保存篮板和篮筐坐标）
+python3 select_roi.py video.mp4
+
+# 2. 运行检测
+python3 backboard_ball_detector.py video.mp4
+
+# 指定输出目录
+python3 backboard_ball_detector.py video.mp4 --output-dir my_output
 ```
 
-首次运行会弹出 OpenCV 窗口，用鼠标拖拽框选篮筐位置，按 Enter 确认。ROI 会自动保存到 `视频名_roi.txt`，下次可复用。
+ROI文件命名规则：`video_backboard_roi.txt`、`video_hoop_roi.txt`（与视频同名前缀）
 
-### 指定篮筐位置
+## ROI 标定说明
 
-```bash
-# 直接传入 ROI (x, y, width, height)
-python basketball_clipper.py input_video.mp4 --roi 300,100,80,60
+- **篮板ROI**：框住整个篮板矩形，包含篮筐在内，适当留出余量
+- **篮筐ROI**：精确框住篮筐内圆口（篮筐开口，不含篮板）
+- 坐标格式：`x,y,w,h`（绝对像素坐标）
 
-# 从文件读取 ROI
-python basketball_clipper.py input_video.mp4 --roi-file video_roi.txt
+```
+test-22_backboard_roi.txt: 655,320,83,48
+test-22_hoop_roi.txt:      671,358,26,25
 ```
 
-### 调整检测参数
+## 进球判定逻辑（check_basket）
 
-```bash
-# 提高灵敏度（适合光线较暗或球速较快的视频）
-python basketball_clipper.py input_video.mp4 --threshold 20 --min-area 150
+1. **排除静止伪影**：所有轨迹点聚在3px范围内 → 拒绝
+2. **轨迹去噪**：去除占40%以上的静止聚类点，暴露真实球运动
+3. **Rule 1**：球必须有至少一个点高于篮筐口（y < hoop_y_rel）
+4. **Rule 2a**：球从篮筐上方穿过（上→下），且穿越X坐标在篮筐范围±4px内，穿越后不反弹回篮筐上方 → 进球
+5. **Rule 2b**：球在event_time+0.3s内消失，最后X在篮筐范围±4px内，且向下运动 → 进球（穿网）
 
-# 降低灵敏度（减少误检）
-python basketball_clipper.py input_video.mp4 --threshold 35 --min-area 300
-```
+## 镜头漂移修正
 
-### 自定义剪辑时长
+长时间拍摄时镜头会缓慢偏移，导致篮筐在ROI内的位置变化。程序在每次轨迹分析前，
+通过模板匹配将当前帧与视频第一帧比较，自动计算偏移量（dx, dy），动态修正篮筐坐标。
 
-```bash
-# 剪辑事件前 8 秒 + 后 2 秒
-python basketball_clipper.py input_video.mp4 --clip-before 8 --clip-after 2
-```
+test-22.mp4 实测漂移：视频开始约+2px，11分钟时峰值+13px，之后略有回落（均为水平方向）。
 
-### 自定义输出目录
+## 长事件处理
 
-```bash
-python basketball_clipper.py input_video.mp4 --output-dir my_clips
-```
+事件跨度 > 3s 时，以 best_frame（信号最强帧）为中心，同时将轨迹分析窗口向前延伸至
+事件起始帧（`extra_pre = event_time - event_start`），确保进球时刻落在分析范围内。
 
-## 参数说明
+## 主要参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `input` | (必填) | 输入视频路径 |
-| `--roi` | 无 | 篮筐 ROI: x,y,w,h |
-| `--roi-file` | 无 | 从文件读取 ROI |
-| `--threshold` | 25 | 帧差二值化阈值，越小越敏感 |
-| `--min-area` | 200 | 最小轮廓面积，过滤噪声 |
-| `--clip-before` | 5.0 | 剪辑事件前秒数 |
-| `--clip-after` | 1.0 | 剪辑事件后秒数 |
-| `--output-dir` | output | 输出目录 |
+| `--interval` | 0.1s | Phase 1 采样间隔 |
+| `--rolling-window` | 1.5s | 滚动差分参考窗口 |
+| `--threshold` | 25 | 差分二值化阈值 |
+| `--min-coverage` | 0.55 | 球检测差分覆盖率下限 |
+| `--cluster-gap` | 2.0s | 事件聚类间隔阈值 |
+| `--traj-window` | 1.0s | 轨迹分析窗口（事件前后各N秒） |
+| `--traj-step` | 0.05s | 轨迹采样步长 |
 
-## ROI 标注操作
+## 输出结构
 
-- **鼠标拖拽**: 绘制矩形框
-- **Enter / Space**: 确认选区
-- **R**: 重新绘制
-- **Q**: 退出
+```
+output_dir/
+├── event01_17.9s.png          # Phase 1/2 检测帧（篮板ROI + 差分热力图）
+├── event01_17.9s_traj.png     # Phase 3 轨迹图（黄线=篮筐口，蓝→红=时间）
+├── ...
+└── baskets/
+    ├── basket01_t17.9s.mp4    # 进球完整画面（前3s + 后1s）
+    ├── basket02_t67.5s.mp4
+    └── ...
+```
 
-## 输出
+## 性能（test-22.mp4，23个进球）
 
-- 输出格式：MP4 (H.264)
-- 文件命名：`shot_001_12.5s.mp4`（序号 + 事件时间）
-- 默认保存到 `output/` 目录
+| 版本 | TP | FP | FN | P | R | F1 | 主要改进 |
+|------|----|----|----|----|----|----|---------|
+| v2基线 | 11 | 11 | 12 | 50% | 48% | 49% | — |
+| v4 | 14 | 14 | 9 | 50% | 61% | 55% | 放宽X容差、轨迹去噪 |
+| v5 | 17 | 12 | 6 | 59% | 74% | 65% | 向下运动检测、长事件处理 |
+| v6b | 21 | 14 | 2 | 60% | 91% | 72% | event_start窗口扩展、Rule 2b加x_tol |
+| **v7** | **22** | **12** | **1** | **65%** | **96%** | **77%** | **镜头漂移动态修正** |
 
-## 检测原理
-
-1. 每秒提取 1 帧
-2. 对篮筐区域相邻帧做差分，检测新出现的运动物体
-3. 验证运动轨迹是否从上到下穿过方框（排除水平运动、反弹等）
-4. 确认投篮后剪辑前后视频片段
+剩余问题：12个FP（待改进），1个FN（gt#15=972s，与相邻进球时间差14.6s超出容差）
