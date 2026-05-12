@@ -13,9 +13,104 @@
 import argparse
 import collections
 import os
+import shutil
+import subprocess
 import sys
+import time
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+
+_FFMPEG_BIN = None
+_MORPH_KERNEL_3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+def find_ffmpeg():
+    """查找 ffmpeg 可执行文件路径，找不到返回 None。"""
+    global _FFMPEG_BIN
+    if _FFMPEG_BIN is not None:
+        return _FFMPEG_BIN or None
+    path = shutil.which("ffmpeg")
+    if not path:
+        for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/local/bin/ffmpeg"):
+            if os.path.exists(p):
+                path = p
+                break
+    _FFMPEG_BIN = path or ""
+    return path or None
+
+# ── PIL 文字渲染 ─────────────────────────────────────────────────────────────
+
+_CJK_FONT = None
+
+def _find_cjk_font():
+    global _CJK_FONT
+    if _CJK_FONT is not None:
+        return _CJK_FONT
+    candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            _CJK_FONT = p
+            return p
+    _CJK_FONT = ""
+    return ""
+
+
+_FONT_CACHE = {}
+
+def _get_pil_font(size):
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+    path = _find_cjk_font()
+    font = ImageFont.load_default()
+    if path:
+        try:
+            font = ImageFont.truetype(path, size)
+        except Exception:
+            pass
+    _FONT_CACHE[size] = font
+    return font
+
+
+def pil_put_text(frame_bgr, text, org, font_size=16, color=(255, 255, 255),
+                 bg_color=None, anchor="lt"):
+    """在 OpenCV BGR 帧上用 PIL 绘制文字，支持中文。
+
+    Args:
+        frame_bgr: numpy BGR 图像 (就地修改)
+        text:      文字内容
+        org:       (x, y) 左上角坐标
+        font_size: 字体大小
+        color:     BGR 颜色
+        bg_color:  背景色 (BGR)，None 表示无背景
+        anchor:    PIL 锚点 (lt=左上)
+    Returns: 修改后的帧
+    """
+    img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(img_rgb)
+    draw = ImageDraw.Draw(pil_img)
+    font = _get_pil_font(font_size)
+
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x, y = org
+
+    if bg_color is not None:
+        pad = 4
+        bg_rgb = (bg_color[2], bg_color[1], bg_color[0])
+        draw.rectangle([x - pad, y - pad, x + tw + pad, y + th + pad], fill=bg_rgb)
+
+    txt_rgb = (color[2], color[1], color[0])
+    draw.text((x, y), text, font=font, fill=txt_rgb)
+
+    cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR, dst=frame_bgr)
+    return frame_bgr
 
 
 def load_roi(path):
@@ -29,14 +124,166 @@ def crop_roi(frame, roi):
     return frame[max(0, y):min(fh, y + h), max(0, x):min(fw, x + w)]
 
 
+def select_frame(video_path):
+    """用进度条手动选取一帧，返回 numpy 帧或 None。"""
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    if total <= 0:
+        cap.release()
+        return None
+
+    cur_fn = [0]
+    frame_cache = [None]
+    dragging = [False]
+
+    def load(f):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, f)
+        ret, img = cap.read()
+        return img if ret else None
+
+    frame_cache[0] = load(0)
+
+    win = "选择参考帧  Enter确认 | Q退出"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 1280, 720)
+
+    hint = "拖动底部进度条选帧 | Enter确认 | Q退出"
+
+    def seek_from_x(x, image_width):
+        bar_x1 = 28
+        bar_x2 = max(bar_x1 + 1, image_width - 28)
+        ratio = (min(max(x, bar_x1), bar_x2) - bar_x1) / (bar_x2 - bar_x1)
+        fn = int(round(ratio * (total - 1)))
+        if fn != cur_fn[0]:
+            cur_fn[0] = fn
+            new_frame = load(fn)
+            if new_frame is not None:
+                frame_cache[0] = new_frame
+
+    def mouse_cb(event, x, y, flags, _):
+        if frame_cache[0] is None:
+            return
+        h, w = frame_cache[0].shape[:2]
+        bar_y = h - 38
+        in_bar = bar_y - 16 <= y <= bar_y + 16
+        if event == cv2.EVENT_LBUTTONDOWN and in_bar:
+            dragging[0] = True
+            seek_from_x(x, w)
+        elif event == cv2.EVENT_MOUSEMOVE and dragging[0]:
+            seek_from_x(x, w)
+        elif event == cv2.EVENT_LBUTTONUP:
+            if dragging[0]:
+                seek_from_x(x, w)
+            dragging[0] = False
+
+    cv2.setMouseCallback(win, mouse_cb)
+
+    while True:
+        if frame_cache[0] is not None:
+            display = frame_cache[0].copy()
+            fn = cur_fn[0]
+            sec = fn / fps
+            pil_put_text(display, f"帧 {fn}/{total}  {sec:.2f}s", (8, 8),
+                         font_size=30, color=(0, 255, 255), bg_color=(0, 0, 0))
+            pil_put_text(display, hint, (8, 56), font_size=28, color=(200, 200, 200),
+                         bg_color=(0, 0, 0))
+            h, w = display.shape[:2]
+            bar_x1, bar_x2 = 28, w - 28
+            bar_y = h - 38
+            ratio = fn / max(total - 1, 1)
+            knob_x = int(round(bar_x1 + ratio * (bar_x2 - bar_x1)))
+            cv2.line(display, (bar_x1, bar_y), (bar_x2, bar_y), (80, 80, 80), 8, cv2.LINE_AA)
+            cv2.line(display, (bar_x1, bar_y), (knob_x, bar_y), (0, 220, 255), 8, cv2.LINE_AA)
+            cv2.circle(display, (knob_x, bar_y), 13, (0, 220, 255), -1, cv2.LINE_AA)
+            cv2.circle(display, (knob_x, bar_y), 13, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.imshow(win, display)
+
+        key = cv2.waitKey(30) & 0xFF
+        if key in (13, 32) and frame_cache[0] is not None:
+            cv2.destroyWindow(win)
+            cap.release()
+            return frame_cache[0]
+        elif key == ord('q'):
+            cv2.destroyWindow(win)
+            cap.release()
+            return None
+        elif key in (81, 2424832, ord('a')):
+            cur_fn[0] = max(0, cur_fn[0] - 1)
+            frame_cache[0] = load(cur_fn[0])
+        elif key in (83, 2555904, ord('d')):
+            cur_fn[0] = min(total - 1, cur_fn[0] + 1)
+            frame_cache[0] = load(cur_fn[0])
+
+
+def select_roi(frame, label="ROI"):
+    """在已有的第一帧上交互式框选 ROI，返回 (x, y, w, h) 或 None。
+    窗口在确认后立刻关闭。
+    """
+    roi = None
+    drawing = False
+    x1 = y1 = x2 = y2 = 0
+
+    hint = f"框选{label}  拖拽绘制 | Enter确认 | R重绘 | Q退出"
+    # 预渲染提示文字到 base 上，鼠标回调里不再做文字渲染
+    base = frame.copy()
+    pil_put_text(base, hint, (8, 8), font_size=28, color=(200, 200, 200),
+                 bg_color=(0, 0, 0))
+
+    def mouse_cb(event, x, y, flags, _):
+        nonlocal drawing, x1, y1, x2, y2, roi
+        if event == cv2.EVENT_LBUTTONDOWN:
+            drawing = True
+            x1, y1 = x, y
+        elif event == cv2.EVENT_MOUSEMOVE and drawing:
+            x2, y2 = x, y
+        elif event == cv2.EVENT_LBUTTONUP:
+            drawing = False
+            x2, y2 = x, y
+            xn, yn = min(x1, x2), min(y1, y2)
+            w, h = abs(x2 - x1), abs(y2 - y1)
+            if w > 5 and h > 5:
+                roi = (xn, yn, w, h)
+
+    win = f"框选{label}"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 1280, 720)
+    cv2.setMouseCallback(win, mouse_cb)
+
+    while True:
+        # 每帧从 base 复制，只做 cv2.rectangle（纯 C 实现，极快）
+        display = base.copy()
+        if drawing:
+            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        elif roi:
+            xn, yn, w, h = roi
+            cv2.rectangle(display, (xn, yn), (xn + w, yn + h), (0, 255, 0), 2)
+            pil_put_text(display, f"{label}: x={xn} y={yn} w={w} h={h}",
+                         (8, 8), font_size=28, color=(0, 255, 0), bg_color=(0, 0, 0))
+        cv2.imshow(win, display)
+        key = cv2.waitKey(15) & 0xFF
+        if key in (13, 32) and roi:
+            cv2.destroyWindow(win)
+            return roi
+        elif key == ord('r'):
+            roi = None
+        elif key == ord('q'):
+            cv2.destroyWindow(win)
+            return None
+
+
+def save_roi(roi, path):
+    with open(path, 'w') as f:
+        f.write(f"{roi[0]},{roi[1]},{roi[2]},{roi[3]}\n")
+
+
 def detect_ball(diff_raw, ball_diameter, noise_thresh, min_coverage, border_margin, roi_w, roi_h):
     """差分图中检测球体：面积 / 圆形度 / 边缘距离 / 差分覆盖率四重过滤
 
     Returns: list of (cx, cy, radius, coverage)
     """
     _, thresh = cv2.threshold(diff_raw, noise_thresh, 255, cv2.THRESH_BINARY)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, _MORPH_KERNEL_3)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     r = ball_diameter / 2
@@ -64,12 +311,17 @@ def detect_ball(diff_raw, ball_diameter, noise_thresh, min_coverage, border_marg
         if perim > 0 and (4 * np.pi * area / perim ** 2) < 0.35:
             continue
 
-        mask = np.zeros(diff_raw.shape, dtype=np.uint8)
-        cv2.drawContours(mask, [cnt], -1, 255, cv2.FILLED)
+        x, y, w, h = cv2.boundingRect(cnt)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        shifted = cnt.copy()
+        shifted[:, 0, 0] -= x
+        shifted[:, 0, 1] -= y
+        cv2.drawContours(mask, [shifted], -1, 255, cv2.FILLED)
         inside_total = cv2.countNonZero(mask)
         if inside_total == 0:
             continue
-        active = int(np.sum(diff_raw[mask > 0] >= noise_thresh))
+        roi_diff = diff_raw[y:y + h, x:x + w]
+        active = int(np.count_nonzero(roi_diff[mask > 0] >= noise_thresh))
         coverage = active / inside_total
         if coverage < min_coverage:
             continue
@@ -154,8 +406,8 @@ def analyze_trajectory(video_path, event_time, bb_roi, ball_diameter, fps,
 
     trajectory, frames = [], []
     fn = start_fn
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_fn)
     while fn <= end_fn:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
         ret, frame = cap.read()
         if not ret:
             break
@@ -179,6 +431,9 @@ def analyze_trajectory(video_path, event_time, bb_roi, ball_diameter, fps,
         frames.append({'t': t, 'crop': crop.copy(),
                        'diff_filt': diff_filt.astype(np.uint8), 'hits': hits})
         fn += step_frames
+        if fn <= end_fn and step_frames > 1:
+            if not _skip_frames(cap, step_frames - 1):
+                break
 
     cap.release()
     return trajectory, frames
@@ -356,62 +611,68 @@ def make_trajectory_image(bg_crop, trajectory, bb_roi, hoop_roi, label, scale=4)
     bh, bw = vis.shape[:2]
     big = cv2.resize(vis, (bw * s, bh * s), interpolation=cv2.INTER_NEAREST)
 
-    is_basket = "basket" in label
+    is_basket = "进球" in label or "basket" in label
     color = (50, 220, 50) if is_basket else (50, 50, 220)
-    cv2.putText(big, label, (6, 18), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, color, 1, cv2.LINE_AA)
+    pil_put_text(big, label, (6, 4), font_size=16, color=color, bg_color=(0, 0, 0))
     return big
 
 
-def clip_roi_video(video_path, bb_roi, event_time, fps, output_path, window=0.5):
-    """将事件 ±window 秒的篮板 ROI 帧写成视频"""
+def _get_video_duration(video_path):
     cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    src_fps = cap.get(cv2.CAP_PROP_FPS)
-    roi_w, roi_h = bb_roi[2], bb_roi[3]
-
-    start_fn = max(0, int(round((event_time - window) * src_fps)))
-    end_fn   = min(total - 1, int(round((event_time + window) * src_fps)))
-
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(output_path, fourcc, src_fps, (roi_w, roi_h))
-
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_fn)
-    for _ in range(end_fn - start_fn + 1):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        crop = crop_roi(frame, bb_roi)
-        if crop.shape[:2] == (roi_h, roi_w):
-            writer.write(crop)
-
-    writer.release()
     cap.release()
+    return total / fps if fps > 0 else 0.0
+
+
+def _ffmpeg_clip(video_path, start_time, duration, output_path, vf=None):
+    """调用 ffmpeg 剪辑指定时间段（含音频）。vf 可选视频滤镜，如裁剪。"""
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("未找到 ffmpeg，请先 `brew install ffmpeg`（音频需要 ffmpeg）")
+
+    cmd = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-ss", f"{start_time:.3f}",
+        "-i", video_path,
+        "-t", f"{duration:.3f}",
+    ]
+    if vf:
+        cmd += ["-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
+    cmd += ["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", output_path]
+
+    subprocess.run(cmd, check=True)
+
+
+def clip_roi_video(video_path, bb_roi, event_time, fps, output_path, window=0.5):
+    """将事件 ±window 秒的篮板 ROI 帧写成视频（含原音频）"""
+    duration_total = _get_video_duration(video_path)
+    start_time = max(0.0, event_time - window)
+    end_time   = min(duration_total, event_time + window)
+    if end_time <= start_time:
+        return
+    x, y, w, h = bb_roi
+    _ffmpeg_clip(video_path, start_time, end_time - start_time, output_path,
+                 vf=f"crop={w}:{h}:{x}:{y}")
 
 
 def clip_full_video(video_path, event_time, output_path, pre=3.0, post=1.0):
-    """将进球事件前 pre 秒、后 post 秒的完整画面写成视频"""
-    cap = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    src_fps = cap.get(cv2.CAP_PROP_FPS)
-    fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    """将进球事件前 pre 秒、后 post 秒的完整画面写成视频（含原音频）"""
+    duration_total = _get_video_duration(video_path)
+    start_time = max(0.0, event_time - pre)
+    end_time   = min(duration_total, event_time + post)
+    if end_time <= start_time:
+        return
+    _ffmpeg_clip(video_path, start_time, end_time - start_time, output_path)
 
-    start_fn = max(0, int(round((event_time - pre) * src_fps)))
-    end_fn   = min(total - 1, int(round((event_time + post) * src_fps)))
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(output_path, fourcc, src_fps, (fw, fh))
-
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_fn)
-    for _ in range(end_fn - start_fn + 1):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        writer.write(frame)
-
-    writer.release()
-    cap.release()
+def _skip_frames(cap, count):
+    for _ in range(count):
+        if not cap.grab():
+            return False
+    return True
 
 
 # ── main ────────────────────────────────────────────────────────────────────
@@ -435,18 +696,52 @@ def main():
                     help="轨迹采样间隔（秒，默认 0.05）")
     ap.add_argument("--scale",          type=int,   default=4)
     ap.add_argument("--output-dir",     default="backboard_detections")
+    ap.add_argument("--profile",        action="store_true",
+                    help="输出各阶段耗时统计")
+    ap.add_argument("--keep-debug-images", action="store_true",
+                    help="保留事件截图和轨迹 PNG（默认只输出进球视频）")
     args = ap.parse_args()
 
     stem = os.path.splitext(args.video)[0]
     bb_roi_path   = args.backboard_roi or f"{stem}_backboard_roi.txt"
     hoop_roi_path = args.hoop_roi      or f"{stem}_hoop_roi.txt"
 
-    for p in [args.video, bb_roi_path, hoop_roi_path]:
-        if not os.path.exists(p):
-            print(f"错误: 不存在: {p}"); sys.exit(1)
+    if not os.path.exists(args.video):
+        print(f"错误: 视频不存在: {args.video}"); sys.exit(1)
 
-    bb_roi   = load_roi(bb_roi_path)
-    hoop_roi = load_roi(hoop_roi_path)
+    if not find_ffmpeg():
+        print("错误: 未找到 ffmpeg，进球剪辑需要它来保留音频。"); print("       请运行: brew install ffmpeg"); sys.exit(1)
+
+    need_select = not os.path.exists(bb_roi_path) or not os.path.exists(hoop_roi_path)
+    ref_frame = None
+    if need_select:
+        print("请选择一帧作为参考（拖动进度条选帧）...")
+        ref_frame = select_frame(args.video)
+        if ref_frame is None:
+            print("已取消"); sys.exit(1)
+
+    # ROI 文件不存在时，交互式框选
+    if not os.path.exists(bb_roi_path):
+        print("框选篮板范围...")
+        bb_roi = select_roi(ref_frame, label="标记篮板范围")
+        if bb_roi is None:
+            print("已取消"); sys.exit(1)
+        save_roi(bb_roi, bb_roi_path)
+        print(f"篮板 ROI 已保存: {bb_roi}")
+    else:
+        bb_roi = load_roi(bb_roi_path)
+
+    if not os.path.exists(hoop_roi_path):
+        print("框选篮筐位置...")
+        hoop_roi = select_roi(ref_frame, label="标记篮筐位置")
+        if hoop_roi is None:
+            print("已取消"); sys.exit(1)
+        save_roi(hoop_roi, hoop_roi_path)
+        print(f"篮筐 ROI 已保存: {hoop_roi}")
+    else:
+        hoop_roi = load_roi(hoop_roi_path)
+
+    ref_frame = None  # 释放帧数据
     ball_diameter = hoop_roi[2] / 2
     roi_w, roi_h  = bb_roi[2], bb_roi[3]
     hoop_y_rel    = hoop_roi[1] - bb_roi[1]
@@ -458,8 +753,9 @@ def main():
     print(f"差分阈值      : {args.threshold}  覆盖率下限: {args.min_coverage:.0%}")
     print(f"聚类 gap      : {args.cluster_gap}s")
     print(f"轨迹窗口      : ±{args.traj_window}s  步长: {args.traj_step}s\n")
+    print(f"调试图片      : {'保留' if args.keep_debug_images else '不保留'}\n")
 
-    # ── Phase 1: 扫描检测 ────────────────────────────────────────
+    # ── 流式扫描 + 即时处理 ───────────────────────────────────────
     cap = cv2.VideoCapture(args.video)
     fps   = cap.get(cv2.CAP_PROP_FPS)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -470,11 +766,86 @@ def main():
     print(f"视频: {total}帧 @ {fps:.0f}fps | 步长: {interval_frames}帧 | 缓冲: {buf_size}\n")
 
     os.makedirs(args.output_dir, exist_ok=True)
+    basket_dir = os.path.join(args.output_dir, "baskets")
+    os.makedirs(basket_dir, exist_ok=True)
+    stage_times = collections.Counter()
+
+    def process_event(cluster, event_idx):
+        """处理一个已完结的事件：事件图 → 轨迹分析 → 进球则剪辑"""
+        t_stage = time.perf_counter()
+        t0  = cluster[0]['time']
+        t1  = cluster[-1]['time']
+        rep = best_frame(cluster)
+        best_cov = max(h[3] for h in rep['hits'])
+        print(f"  事件 {event_idx:02d}  {t0:.1f}~{t1:.1f}s  ({len(cluster)}帧)  "
+              f"最佳: {rep['time']:.1f}s  覆盖={best_cov:.0%}  Δ={rep['change_px']}px")
+
+        if args.keep_debug_images:
+            img = make_event_image(rep['crop'], rep['diff_filt'], rep['hits'], args.scale)
+            pil_put_text(img,
+                         f"事件{event_idx:02d} t={rep['time']:.1f}s 区间={t0:.1f}~{t1:.1f}s n={len(cluster)} 覆盖={best_cov:.0%}",
+                         (6, 4), font_size=16, color=(255, 255, 255), bg_color=(0, 0, 0))
+            cv2.imwrite(os.path.join(args.output_dir, f"event{event_idx:02d}_{rep['time']:.1f}s.png"), img)
+
+        # 轨迹分析
+        span_dur = t1 - t0
+        event_time = rep['time'] if span_dur > 3.0 else (t0 + t1) / 2
+        extra_pre = max(0.0, event_time - t0) if span_dur > 3.0 else 0.0
+
+        traj, _ = analyze_trajectory(
+            args.video, event_time, bb_roi, ball_diameter, fps,
+            args.threshold, args.min_coverage, args.border_margin,
+            args.traj_window, args.traj_step, extra_pre,
+        )
+        traj, n_removed = denoise_trajectory(traj)
+
+        bg_fn = max(0, int(round((event_time - 2.0 - extra_pre) * fps)))
+        dx, dy = compute_hoop_drift(args.video, bb_roi, fps, ref_fn=0, query_fn=bg_fn)
+        cur_hoop_roi = (hoop_roi[0] + dx, hoop_roi[1] + dy, hoop_roi[2], hoop_roi[3])
+
+        is_basket, reason = check_basket(traj, bb_roi, cur_hoop_roi, event_time)
+
+        traj_summary = " ".join(
+            f"t{p[0]:.2f}→({p[1]},{p[2]})" for p in traj
+        ) or "(无轨迹点)"
+        mark = "进球" if is_basket else "未进"
+        span = f"{t0:.1f}~{t1:.1f}s"
+        denoise_note = f"  [-{n_removed}噪声]" if n_removed else ""
+        center_note  = f"(最佳帧)" if span_dur > 3.0 else "(中点)"
+        drift_note   = f"  drift=({dx:+d},{dy:+d})" if (dx or dy) else ""
+        print(f"\n  事件 {event_idx:02d} 区间={span} 中心={event_time:.1f}s{center_note}  轨迹={len(traj)}点{denoise_note}{drift_note}  [{mark}] {reason}")
+        print(f"    {traj_summary}")
+
+        # 轨迹可视化
+        if args.keep_debug_images:
+            cap_tmp = cv2.VideoCapture(args.video)
+            cap_tmp.set(cv2.CAP_PROP_POS_FRAMES, bg_fn)
+            ret_bg, bg_frame = cap_tmp.read()
+            cap_tmp.release()
+            if ret_bg:
+                bg_crop = crop_roi(bg_frame, bb_roi)
+                dn_note = f" 去噪-{n_removed}" if n_removed else ""
+                label   = f"事件{event_idx:02d} t={event_time:.1f}s{dn_note} | {mark}: {reason}"
+                traj_img = make_trajectory_image(bg_crop, traj, bb_roi, cur_hoop_roi,
+                                                 label, args.scale)
+                cv2.imwrite(
+                    os.path.join(args.output_dir, f"event{event_idx:02d}_{event_time:.1f}s_traj.png"),
+                    traj_img,
+                )
+
+        # 进球则立即剪辑
+        if is_basket:
+            out_path = os.path.join(basket_dir, f"basket{event_idx:02d}_t{event_time:.1f}s.mp4")
+            clip_full_video(args.video, event_time, out_path, pre=3.0, post=1.0)
+            print(f"  → 进球剪辑: {out_path}")
+        stage_times["event"] += time.perf_counter() - t_stage
 
     buf = collections.deque(maxlen=buf_size)
     n_sampled = n_change = 0
-    all_detections = []
+    n_events = 0
+    cur_cluster = []
     fn = 0
+    t_scan = time.perf_counter()
 
     while True:
         ret, frame = cap.read()
@@ -487,7 +858,7 @@ def main():
                 buf.append((fn, gray, crop.copy()))
                 n_sampled += 1
                 if len(buf) == buf_size:
-                    ref_fn, ref_gray, _ = buf[0]
+                    ref_gray = buf[0][1]
                     diff = cv2.absdiff(ref_gray, gray)
                     diff_filt = diff.astype(np.float32)
                     diff_filt[diff_filt < args.threshold] = 0
@@ -498,107 +869,35 @@ def main():
                                            args.min_coverage, args.border_margin,
                                            roi_w, roi_h)
                         if hits:
-                            all_detections.append({
+                            det = {
                                 'fn': fn, 'time': fn / fps,
                                 'crop': crop.copy(),
                                 'diff_filt': diff_filt.astype(np.uint8),
                                 'hits': hits, 'change_px': change_px,
-                            })
+                            }
+                            # 新事件：当前事件与上一个候选间隔超过阈值 → 结算上一个事件
+                            if cur_cluster and (det['time'] - cur_cluster[-1]['time'] > args.cluster_gap):
+                                n_events += 1
+                                process_event(cur_cluster, n_events)
+                                cur_cluster = []
+                            cur_cluster.append(det)
+        if interval_frames > 1 and fn + interval_frames < total:
+            if not _skip_frames(cap, interval_frames - 1):
+                break
+            fn += interval_frames - 1
         fn += 1
 
     cap.release()
-    print(f"扫描完成: 采样 {n_sampled} | 变化 {n_change} | 球候选 {len(all_detections)}")
+    stage_times["scan"] = time.perf_counter() - t_scan
 
-    # ── Phase 2: 聚类 ────────────────────────────────────────────
-    events = cluster_detections(all_detections, args.cluster_gap)
-    print(f"聚类（gap≤{args.cluster_gap}s）→ {len(events)} 个事件\n")
+    # 处理最后一个事件
+    if cur_cluster:
+        n_events += 1
+        process_event(cur_cluster, n_events)
 
-    for i, event in enumerate(events, 1):
-        t0  = event[0]['time']
-        t1  = event[-1]['time']
-        rep = best_frame(event)
-        best_cov = max(h[3] for h in rep['hits'])
-        print(f"  事件 {i:02d}  {t0:.1f}~{t1:.1f}s  ({len(event)}帧)  "
-              f"最佳: {rep['time']:.1f}s  cov={best_cov:.0%}  Δ={rep['change_px']}px")
-
-        img = make_event_image(rep['crop'], rep['diff_filt'], rep['hits'], args.scale)
-        cv2.putText(img,
-                    f"ev{i:02d} t={rep['time']:.1f}s span={t0:.1f}~{t1:.1f}s n={len(event)} cov={best_cov:.0%}",
-                    (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.imwrite(os.path.join(args.output_dir, f"event{i:02d}_{rep['time']:.1f}s.png"), img)
-
-    # ── Phase 3: 轨迹分析 + 进球识别 ────────────────────────────
-    print(f"\n── 轨迹分析（±{args.traj_window}s @ {args.traj_step}s步）────────────────")
-    basket_dir = os.path.join(args.output_dir, "baskets")
-    os.makedirs(basket_dir, exist_ok=True)
-
-    basket_candidates = []
-
-    for i, event in enumerate(events, 1):
-        rep = best_frame(event)
-        span_dur = event[-1]['time'] - event[0]['time']
-        event_time = rep['time'] if span_dur > 3.0 else (event[0]['time'] + event[-1]['time']) / 2
-
-        extra_pre = max(0.0, event_time - event[0]['time']) if span_dur > 3.0 else 0.0
-        traj, _ = analyze_trajectory(
-            args.video, event_time, bb_roi, ball_diameter, fps,
-            args.threshold, args.min_coverage, args.border_margin,
-            args.traj_window, args.traj_step, extra_pre,
-        )
-
-        traj, n_removed = denoise_trajectory(traj)
-
-        # 镜头漂移修正：用背景帧与视频第一帧做模板匹配，动态调整篮筐坐标
-        bg_fn = max(0, int(round((event_time - 2.0 - extra_pre) * fps)))
-        dx, dy = compute_hoop_drift(args.video, bb_roi, fps, ref_fn=0, query_fn=bg_fn)
-        cur_hoop_roi = (hoop_roi[0] + dx, hoop_roi[1] + dy, hoop_roi[2], hoop_roi[3])
-
-        is_basket, reason = check_basket(traj, bb_roi, cur_hoop_roi, event_time)
-
-        traj_summary = " ".join(
-            f"t{p[0]:.2f}→({p[1]},{p[2]})" for p in traj
-        ) or "(no points)"
-        mark = "BASKET" if is_basket else "miss"
-        span = f"{event[0]['time']:.1f}~{event[-1]['time']:.1f}s"
-        denoise_note = f"  [-{n_removed}noise]" if n_removed else ""
-        center_note  = f"(best)" if span_dur > 3.0 else "(mid)"
-        drift_note   = f"  drift=({dx:+d},{dy:+d})" if (dx or dy) else ""
-        print(f"\n  event {i:02d} span={span} center={event_time:.1f}s{center_note}  traj={len(traj)}pts{denoise_note}{drift_note}  [{mark}] {reason}")
-        print(f"    {traj_summary}")
-
-        # trajectory overlay image（黄线显示漂移修正后的篮筐位置）
-        cap_tmp = cv2.VideoCapture(args.video)
-        cap_tmp.set(cv2.CAP_PROP_POS_FRAMES, bg_fn)
-        ret_bg, bg_frame = cap_tmp.read()
-        cap_tmp.release()
-        if ret_bg:
-            bg_crop = crop_roi(bg_frame, bb_roi)
-            dn_note = f" dn-{n_removed}" if n_removed else ""
-            label   = f"ev{i:02d} t={event_time:.1f}s{dn_note} | {mark}: {reason}"
-            traj_img = make_trajectory_image(bg_crop, traj, bb_roi, cur_hoop_roi,
-                                             label, args.scale)
-            cv2.imwrite(
-                os.path.join(args.output_dir, f"event{i:02d}_{event_time:.1f}s_traj.png"),
-                traj_img,
-            )
-
-        if is_basket:
-            ys_t = [p[2] for p in traj]
-            y_span = (max(ys_t) - min(ys_t)) if ys_t else 0
-            basket_candidates.append({
-                'event_idx': i,
-                'event_time': event_time,
-                'conf': len(traj) * y_span,   # more pts × larger arc = higher confidence
-                'reason': reason,
-            })
-
-    basket_candidates.sort(key=lambda x: x['event_time'])
-    for j, b in enumerate(basket_candidates, 1):
-        out_path = os.path.join(basket_dir, f"basket{j:02d}_t{b['event_time']:.1f}s.mp4")
-        clip_full_video(args.video, b['event_time'], out_path, pre=3.0, post=1.0)
-        print(f"  basket{j:02d}  ev{b['event_idx']:02d}  t={b['event_time']:.1f}s  → {out_path}")
-
-    print(f"\nDetected {len(basket_candidates)}/{len(events)} baskets  |  clips: {basket_dir}/")
+    print(f"\n扫描完成: 采样 {n_sampled} | 变化 {n_change} | 球候选 {n_change} | 事件 {n_events}")
+    if args.profile:
+        print(f"耗时统计: 扫描={stage_times['scan']:.2f}s  事件处理={stage_times['event']:.2f}s")
 
 
 if __name__ == "__main__":
